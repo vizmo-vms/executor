@@ -237,9 +237,13 @@ export interface PluginCtx<TStore = unknown> {
      *  `notifications/tools/list_changed` or rejecting a call as an unknown
      *  tool — where an inline `refresh` would block the caller. */
     readonly markToolsStale: (ref: ConnectionRef) => Effect.Effect<void, StorageFailure>;
-    /** Resolve a connection's value through its provider (and OAuth refresh).
+    /** Resolve a connection's primary value through its provider (and OAuth refresh).
      *  null if the provider can't produce one. */
     readonly resolveValue: (ref: ConnectionRef) => Effect.Effect<string | null, StorageFailure>;
+    /** Resolve every named input for a connection through its provider. */
+    readonly resolveValues: (
+      ref: ConnectionRef,
+    ) => Effect.Effect<Record<string, string | null>, StorageFailure>;
   };
 
   /** Registered credential backends — for discovery (browse a backend's items). */

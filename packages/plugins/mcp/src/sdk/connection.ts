@@ -215,19 +215,24 @@ const connectionFromClient = (client: Client): McpConnection => ({
   close: () => client.close(),
 });
 
-const connectionFailure = (
-  transport: string,
-  message: string,
-  cause: unknown,
-): McpConnectionError | McpOAuthReauthorizationRequired => {
-  if (Predicate.isTagged(cause, "McpOAuthReauthorizationRequired")) {
+const connectionFailure = (input: {
+  readonly transport: string;
+  readonly message: string;
+  readonly cause: unknown;
+  readonly command?: string;
+}): McpConnectionError | McpOAuthReauthorizationRequired => {
+  if (Predicate.isTagged(input.cause, "McpOAuthReauthorizationRequired")) {
     return new McpOAuthReauthorizationRequired({ message: "MCP OAuth re-authorization required" });
   }
-  if (Predicate.isTagged(cause, "McpInsufficientScopeError")) {
+  const message =
+    input.transport === "stdio" && input.command !== undefined
+      ? `Could not connect to stdio MCP server using "${input.command}"`
+      : input.message;
+  if (Predicate.isTagged(input.cause, "McpInsufficientScopeError")) {
     // Surfaced as a connection error with the 403 status; the invoke/connect
     // catch sites detect the tag and classify as oauth_scope_insufficient.
     return new McpConnectionError({
-      transport,
+      transport: input.transport,
       message: `${message} (HTTP 403: insufficient scope)`,
       httpStatus: 403,
       insufficientScope: true,
@@ -236,9 +241,9 @@ const connectionFailure = (
   // Carry the handshake HTTP status structurally (and in the message for
   // humans) so the liveness health check can classify a rejected credential
   // as expired rather than a generic connection failure.
-  const status = httpStatusFromCause(cause);
+  const status = httpStatusFromCause(input.cause);
   return new McpConnectionError({
-    transport,
+    transport: input.transport,
     message: status === undefined ? message : `${message} (HTTP ${status})`,
     ...(status === undefined ? {} : { httpStatus: status }),
   });
@@ -246,6 +251,7 @@ const connectionFailure = (
 
 const connectClient = (input: {
   transport: string;
+  command?: string;
   createTransport: () => Parameters<Client["connect"]>[0];
 }): Effect.Effect<McpConnection, McpConnectionError | McpOAuthReauthorizationRequired> =>
   Effect.gen(function* () {
@@ -260,7 +266,12 @@ const connectClient = (input: {
       // integrations stranded a container per interrupted dial (#1631).
       try: (signal) => client.connect(transportInstance, { signal }),
       catch: (cause) =>
-        connectionFailure(input.transport, `Failed connecting via ${input.transport}`, cause),
+        connectionFailure({
+          transport: input.transport,
+          command: input.command,
+          message: `Failed connecting via ${input.transport}`,
+          cause,
+        }),
     }).pipe(
       Effect.withSpan("plugin.mcp.connection.handshake", {
         attributes: { "plugin.mcp.transport": input.transport },
@@ -300,6 +311,7 @@ export const createMcpConnector = (input: ConnectorInput): McpConnector => {
 
       return yield* connectClient({
         transport: "stdio",
+        command: [command, ...(input.args ?? [])].join(" "),
         createTransport: () =>
           createStdioTransport({
             command,
