@@ -18,6 +18,11 @@ RUN bun install --frozen-lockfile --production --ignore-scripts --filter @execut
 FROM oven/bun:1 AS build
 WORKDIR /app
 COPY . .
+# The self-hosted Stdio backend remains runtime-gated. Build this fork's web
+# client with its Stdio integration flow visible so the Coolify runtime opt-in
+# can be configured from the UI instead of only through the API.
+ARG EXECUTOR_ALLOW_STDIO_MCP=true
+ENV EXECUTOR_ALLOW_STDIO_MCP=${EXECUTOR_ALLOW_STDIO_MCP}
 RUN bun install --frozen-lockfile
 RUN cd apps/host-selfhost && bun run build
 
