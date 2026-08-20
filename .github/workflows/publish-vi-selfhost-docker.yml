@@ -70,11 +70,6 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ github.ref_name }}
-      - name: Make the image publicly pullable
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh api --method PATCH "/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/executor" -f visibility=public
-
   e2e:
     needs: publish
     runs-on: ubuntu-latest
