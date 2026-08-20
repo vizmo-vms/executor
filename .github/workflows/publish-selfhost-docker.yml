@@ -1,7 +1,10 @@
 name: Publish Self-host Docker Image
-run-name: "${{ format('publish self-host docker {0}', inputs.tag) }}"
+run-name: "${{ format('publish self-host docker {0}', inputs.tag || github.ref_name) }}"
 
 on:
+  push:
+    tags:
+      - "v*-stdio-ui.*"
   workflow_dispatch:
     inputs:
       tag:
@@ -13,7 +16,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: publish-selfhost-docker-${{ inputs.tag }}
+  group: publish-selfhost-docker-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -43,7 +46,7 @@ jobs:
       - name: Validate release tag
         id: validate
         env:
-          RAW_RELEASE_TAG: ${{ inputs.tag }}
+          RAW_RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: bun run scripts/validate-release-ref.ts --tag-env RAW_RELEASE_TAG --write-env RELEASE_TAG --output tag
 
       - name: Checkout release tag
