@@ -1,0 +1,24 @@
+# syntax=docker/dockerfile:1
+# Derive from the published self-host image; Executor itself is not compiled here.
+ARG EXECUTOR_IMAGE=ghcr.io/vizmo-vms/executor:1.5.42-vi.1
+
+FROM debian:bookworm-slim AS tools
+ARG TARGETARCH
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates curl tar \
+  && rm -rf /var/lib/apt/lists/*
+RUN set -eux; \
+  case "$TARGETARCH" in amd64|arm64) ;; *) echo "Unsupported architecture: $TARGETARCH" >&2; exit 1;; esac; \
+  mkdir -p /tmp/signoz /out; \
+  curl -fsSL -o /tmp/signoz.tar.gz "https://github.com/SigNoz/signoz-mcp-server/releases/latest/download/signoz-mcp-server_linux_${TARGETARCH}.tar.gz"; \
+  tar -xzf /tmp/signoz.tar.gz -C /tmp/signoz; \
+  install -Dm755 /tmp/signoz/signoz-mcp-server /out/signoz-mcp-server
+RUN set -eux; \
+  curl -fsSL -o /tmp/coder-install.sh https://coder.com/install.sh; \
+  sh /tmp/coder-install.sh --stable --method standalone; \
+  install -Dm755 "$(command -v coder)" /out/coder
+
+FROM ${EXECUTOR_IMAGE}
+COPY --from=tools /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=tools /out/signoz-mcp-server /usr/local/bin/signoz-mcp-server
+COPY --from=tools /out/coder /usr/local/bin/coder
