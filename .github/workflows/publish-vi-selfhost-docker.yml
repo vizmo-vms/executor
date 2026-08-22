@@ -30,10 +30,20 @@ jobs:
       - run: docker build --pull --file Dockerfile.coolify --tag executor-tools:e2e .
       - run: docker run --rm --entrypoint /usr/local/bin/node executor-tools:e2e --version
       - run: docker run --rm --entrypoint /usr/local/bin/npx executor-tools:e2e --version
-      - name: Verify npm command shell
-        run: docker run --rm --entrypoint /bin/sh executor-tools:e2e -c 'command -v node && command -v npm && command -v npx'
-      - name: Verify Sentry npx stdio entry point
-        run: docker run --rm --entrypoint /usr/local/bin/npx executor-tools:e2e --yes @sentry/mcp-server@latest --help
+      - name: Verify generic stdio command runtime
+        run: |
+          docker run --rm --entrypoint /bin/bash executor-tools:e2e -lc '
+            set -euo pipefail
+            command -v sh bash env node npm npx bun bunx
+            npm exec --yes --package=cowsay -- cowsay generic-stdio-npx | grep -Fq generic-stdio-npx
+            bunx cowsay generic-stdio-bunx | grep -Fq generic-stdio-bunx
+            printf "%s\\n" "#!/usr/bin/env node" "console.log(\"generic-stdio-shebang\")" > /tmp/stdio-shebang
+            chmod +x /tmp/stdio-shebang
+            test "$(/tmp/stdio-shebang)" = generic-stdio-shebang
+            printf "%s\\n" "#!/bin/sh" "printf generic-stdio-sh" > /tmp/stdio-shell
+            chmod +x /tmp/stdio-shell
+            test "$(/tmp/stdio-shell)" = generic-stdio-sh
+          '
       - run: docker run --rm --entrypoint /usr/local/bin/coder executor-tools:e2e version
       - name: Verify SigNoz validates its required runtime secret
         run: |

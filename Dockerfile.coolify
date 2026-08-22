@@ -3,20 +3,7 @@
 ARG EXECUTOR_IMAGE=ghcr.io/vizmo-vms/executor:1.5.42-vi.1
 ARG NODE_IMAGE=node:24.19.0-bookworm-slim
 
-# Keep Node/npm's runtime files in a Debian 12 stage so they remain compatible
-# with Executor's distroless Debian 12 base. The wrappers avoid /usr/bin/env,
-# which is intentionally absent from the final distroless image.
-FROM ${NODE_IMAGE} AS node
-RUN set -eux; \
-  mkdir -p /out; \
-  printf '%s\n' '#!/usr/local/bin/node' \
-    'require("/usr/local/lib/node_modules/npm/bin/npm-cli.js")' > /out/npm; \
-  printf '%s\n' '#!/usr/local/bin/node' \
-    'require("/usr/local/lib/node_modules/npm/bin/npx-cli.js")' > /out/npx; \
-  chmod 0755 /out/npm /out/npx; \
-  node --version; \
-  npm --version; \
-  npx --version
+FROM ${EXECUTOR_IMAGE} AS executor
 
 FROM debian:bookworm-slim AS tools
 ARG TARGETARCH
@@ -34,17 +21,31 @@ RUN set -eux; \
   sh /tmp/coder-install.sh --stable --method standalone; \
   install -Dm755 "$(command -v coder)" /out/coder
 
-FROM ${EXECUTOR_IMAGE}
+# The published Executor image is intentionally distroless. This image runs
+# user-configured stdio commands, so use a regular Debian runtime and copy the
+# already-built Executor payload into it. This provides a normal POSIX process
+# environment (sh, bash, env, coreutils), Node/npm/npx, and Bun/bunx without
+# recompiling Executor in Coolify.
+FROM ${NODE_IMAGE} AS runtime
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends bash ca-certificates coreutils \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY --from=executor /usr/local/bin/bun /usr/local/bin/bun
+RUN ln -s /usr/local/bin/bun /usr/local/bin/bunx
+COPY --from=executor /app /app
 COPY --from=tools /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-COPY --from=node /usr/local/bin/node /usr/local/bin/node
-COPY --from=node /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
-COPY --from=node /out/npm /usr/local/bin/npm
-COPY --from=node /out/npx /usr/local/bin/npx
-# npm and npx launch package commands through `sh`. The Executor base is
-# distroless, so copy Debian 12's shell from the Node stage into the runtime.
-COPY --from=node /bin/dash /bin/sh
-# Third-party npm CLIs conventionally use `#!/usr/bin/env node`, including
-# Sentry's `sentry-mcp` executable.
-COPY --from=node /usr/bin/env /usr/bin/env
 COPY --from=tools /out/signoz-mcp-server /usr/local/bin/signoz-mcp-server
 COPY --from=tools /out/coder /usr/local/bin/coder
+
+ENV NODE_ENV=production \
+    EXECUTOR_HOST=0.0.0.0 \
+    PORT=4788 \
+    EXECUTOR_DATA_DIR=/data
+WORKDIR /app/apps/host-selfhost
+VOLUME ["/data"]
+EXPOSE 4788
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=5 \
+  CMD ["bun", "-e", "fetch('http://127.0.0.1:4788/api/health').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
+CMD ["bun", "run", "dist-server/serve.js"]
