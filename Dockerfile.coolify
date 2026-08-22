@@ -40,5 +40,8 @@ COPY --from=node /usr/local/bin/node /usr/local/bin/node
 COPY --from=node /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
 COPY --from=node /out/npm /usr/local/bin/npm
 COPY --from=node /out/npx /usr/local/bin/npx
+# npm and npx launch package commands through `sh`. The Executor base is
+# distroless, so copy Debian 12's shell from the Node stage into the runtime.
+COPY --from=node /bin/dash /bin/sh
 COPY --from=tools /out/signoz-mcp-server /usr/local/bin/signoz-mcp-server
 COPY --from=tools /out/coder /usr/local/bin/coder

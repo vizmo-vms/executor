@@ -30,6 +30,8 @@ jobs:
       - run: docker build --pull --file Dockerfile.coolify --tag executor-tools:e2e .
       - run: docker run --rm --entrypoint /usr/local/bin/node executor-tools:e2e --version
       - run: docker run --rm --entrypoint /usr/local/bin/npx executor-tools:e2e --version
+      - name: Verify npm command shell
+        run: docker run --rm --entrypoint /bin/sh executor-tools:e2e -c 'command -v node && command -v npm && command -v npx'
       - run: docker run --rm --entrypoint /usr/local/bin/coder executor-tools:e2e version
       - name: Verify SigNoz validates its required runtime secret
         run: |
