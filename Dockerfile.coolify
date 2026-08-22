@@ -43,5 +43,8 @@ COPY --from=node /out/npx /usr/local/bin/npx
 # npm and npx launch package commands through `sh`. The Executor base is
 # distroless, so copy Debian 12's shell from the Node stage into the runtime.
 COPY --from=node /bin/dash /bin/sh
+# Third-party npm CLIs conventionally use `#!/usr/bin/env node`, including
+# Sentry's `sentry-mcp` executable.
+COPY --from=node /usr/bin/env /usr/bin/env
 COPY --from=tools /out/signoz-mcp-server /usr/local/bin/signoz-mcp-server
 COPY --from=tools /out/coder /usr/local/bin/coder
