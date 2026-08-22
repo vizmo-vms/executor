@@ -31,7 +31,15 @@ jobs:
       - run: docker run --rm --entrypoint /usr/local/bin/node executor-tools:e2e --version
       - run: docker run --rm --entrypoint /usr/local/bin/npx executor-tools:e2e --version
       - run: docker run --rm --entrypoint /usr/local/bin/coder executor-tools:e2e version
-      - run: docker run --rm --entrypoint /usr/local/bin/signoz-mcp-server executor-tools:e2e --help
+      - name: Verify SigNoz validates its required runtime secret
+        run: |
+          set +e
+          output="$(docker run --rm --entrypoint /usr/local/bin/signoz-mcp-server executor-tools:e2e --help 2>&1)"
+          status=$?
+          set -e
+          test "$status" -eq 1
+          printf '%s\n' "$output"
+          grep -Fq "SIGNOZ_API_KEY is required" <<<"$output"
       - run: bunx playwright install --with-deps chromium chromium-headless-shell
         working-directory: e2e
       - run: bunx vitest run --project selfhost-docker --retry=2
