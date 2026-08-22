@@ -1,6 +1,22 @@
 # syntax=docker/dockerfile:1
 # Derive from the published self-host image; Executor itself is not compiled here.
 ARG EXECUTOR_IMAGE=ghcr.io/vizmo-vms/executor:1.5.42-vi.1
+ARG NODE_IMAGE=node:24.19.0-bookworm-slim
+
+# Keep Node/npm's runtime files in a Debian 12 stage so they remain compatible
+# with Executor's distroless Debian 12 base. The wrappers avoid /usr/bin/env,
+# which is intentionally absent from the final distroless image.
+FROM ${NODE_IMAGE} AS node
+RUN set -eux; \
+  mkdir -p /out; \
+  printf '%s\n' '#!/usr/local/bin/node' \
+    'require("/usr/local/lib/node_modules/npm/bin/npm-cli.js")' > /out/npm; \
+  printf '%s\n' '#!/usr/local/bin/node' \
+    'require("/usr/local/lib/node_modules/npm/bin/npx-cli.js")' > /out/npx; \
+  chmod 0755 /out/npm /out/npx; \
+  node --version; \
+  npm --version; \
+  npx --version
 
 FROM debian:bookworm-slim AS tools
 ARG TARGETARCH
@@ -20,5 +36,9 @@ RUN set -eux; \
 
 FROM ${EXECUTOR_IMAGE}
 COPY --from=tools /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=node /usr/local/bin/node /usr/local/bin/node
+COPY --from=node /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
+COPY --from=node /out/npm /usr/local/bin/npm
+COPY --from=node /out/npx /usr/local/bin/npx
 COPY --from=tools /out/signoz-mcp-server /usr/local/bin/signoz-mcp-server
 COPY --from=tools /out/coder /usr/local/bin/coder
