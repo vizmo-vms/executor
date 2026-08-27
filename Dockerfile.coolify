@@ -1,9 +1,21 @@
 # syntax=docker/dockerfile:1
-# Derive from the published self-host image; Executor itself is not compiled here.
-ARG EXECUTOR_IMAGE=ghcr.io/vizmo-vms/executor:1.5.42-vi.1
 ARG NODE_IMAGE=node:24.19.0-bookworm-slim
 
-FROM ${EXECUTOR_IMAGE} AS executor
+# Build Executor from this checkout so every fork release contains the tagged
+# application source instead of inheriting an older published application.
+FROM oven/bun:1 AS prod-deps
+WORKDIR /app
+COPY . .
+RUN bun install --frozen-lockfile --production --ignore-scripts --filter @executor-js/host-selfhost \
+  && bun run apps/host-selfhost/scripts/package-runtime.ts
+
+FROM oven/bun:1 AS build
+WORKDIR /app
+COPY . .
+ARG EXECUTOR_ALLOW_STDIO_MCP=true
+ENV EXECUTOR_ALLOW_STDIO_MCP=${EXECUTOR_ALLOW_STDIO_MCP}
+RUN bun install --frozen-lockfile
+RUN cd apps/host-selfhost && bun run build
 
 FROM debian:bookworm-slim AS tools
 ARG TARGETARCH
@@ -32,9 +44,10 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY --from=executor /usr/local/bin/bun /usr/local/bin/bun
+COPY --from=prod-deps /usr/local/bin/bun /usr/local/bin/bun
 RUN ln -s /usr/local/bin/bun /usr/local/bin/bunx
-COPY --from=executor /app /app
+COPY --from=prod-deps /app/.selfhost-runtime /app
+COPY --from=build /app/apps/host-selfhost/dist /app/apps/host-selfhost/dist
 COPY --from=tools /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=tools /out/signoz-mcp-server /usr/local/bin/signoz-mcp-server
 COPY --from=tools /out/coder /usr/local/bin/coder
