@@ -59,6 +59,10 @@ const AddStdioServerPayload = Schema.Struct({
   /** Static, non-credential environment variables injected into the subprocess. */
   env: Schema.optional(StringMap),
   cwd: Schema.optional(Schema.String),
+  /** Protocol negotiation at connect: `auto` probes `server/discover` (spec
+   *  2026-07-28) for modern-only servers; default is the legacy `initialize`
+   *  handshake. */
+  versionNegotiation: Schema.optional(Schema.Literals(["legacy", "auto"])),
   slug: Schema.optional(Schema.String),
 });
 

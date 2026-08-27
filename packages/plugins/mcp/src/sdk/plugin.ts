@@ -1,9 +1,8 @@
 import { Cause, Effect, Layer, Option, Predicate, Result, Schema } from "effect";
 import type { HttpClient } from "effect/unstable/http";
 
-import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
-import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
-import * as z from "zod/v4";
+import type { OAuthClientProvider } from "@modelcontextprotocol/client";
+import { CallToolResultSchema } from "@modelcontextprotocol/core";
 
 import {
   authToolFailure,
@@ -54,6 +53,7 @@ import { deriveMcpNamespace, type McpToolManifestEntry } from "./manifest";
 import { mcpPresets } from "./presets";
 import { probeMcpEndpointShape, type McpShapeProbeResult } from "./probe-shape";
 import { canonicalizeStdioConfig, sameCanonicalStdioConfig } from "./stdio-config";
+import { recoverSlackConnectFile } from "./slack-connect-file";
 import {
   McpAuthMethodInput,
   McpAuthShorthand,
@@ -63,6 +63,7 @@ import {
   expandMcpAuthMethodInputs,
   mcpAuthMethodFromShorthand,
   normalizeMcpAuthMethods,
+  McpStdioVersionNegotiation,
   parseMcpIntegrationConfig,
   type McpIntegrationConfig as McpIntegrationConfigType,
   type McpStdioEnvMethod,
@@ -206,6 +207,11 @@ const McpStdioServerInputSchema = Schema.Struct({
   /** Static, non-credential environment variables injected into the subprocess. */
   env: Schema.optional(Schema.Record(Schema.String, Schema.String)),
   cwd: Schema.optional(Schema.String),
+  /** Protocol negotiation at connect: `auto` probes `server/discover` (spec
+   *  2026-07-28) for modern-only servers. Defaults to the legacy `initialize`
+   *  handshake — the right call for spawn-per-call servers, where the auto
+   *  probe costs an extra child process per connect. */
+  versionNegotiation: Schema.optional(McpStdioVersionNegotiation),
   slug: Schema.optional(Schema.String),
 });
 
@@ -366,6 +372,7 @@ const toIntegrationConfig = (input: McpServerInput): McpIntegrationConfigType =>
       args: input.args ? [...input.args] : undefined,
       env: input.env && Object.keys(input.env).length > 0 ? { ...input.env } : undefined,
       cwd: input.cwd,
+      versionNegotiation: input.versionNegotiation,
       authenticationTemplate:
         vars.length > 0
           ? [{ slug: STDIO_ENV_TEMPLATE, kind: "stdio_env", vars }]
@@ -388,7 +395,7 @@ type JsonSchemaObject = Record<string, unknown> & {
   readonly properties?: Record<string, unknown>;
 };
 
-const McpCallToolResultJsonSchema = z.toJSONSchema(CallToolResultSchema) as JsonSchemaObject;
+const McpCallToolResultJsonSchema: JsonSchemaObject = CallToolResultSchema.toJSONSchema();
 
 const mcpCallToolResultOutputSchema = (structuredContentSchema?: unknown): JsonSchemaObject => {
   const defaultStructuredContentSchema =
@@ -489,7 +496,9 @@ export const userFacingProbeMessage = (
 // MCP-SDK OAuth provider adapter — wraps a pre-resolved access token so the
 // transport sends it as a Bearer header. Refresh is core's responsibility
 // (the connection row carries the OAuth grant); this adapter never initiates
-// a new flow and fails loudly if the SDK tries to.
+// a new flow and fails loudly if the SDK tries to. V2 stamps stored credentials
+// with the authorization-server issuer and offers scoped invalidation; this
+// single-token boundary intentionally persists neither.
 // ---------------------------------------------------------------------------
 
 const makeOAuthProvider = (accessToken: string): OAuthClientProvider => ({
@@ -582,6 +591,7 @@ const buildConnectorInput = (
       args: config.args,
       env: Object.keys(env).length > 0 ? env : undefined,
       cwd: config.cwd,
+      versionNegotiation: config.versionNegotiation,
     } satisfies McpStdioIntegrationConfig);
   }
 
@@ -980,12 +990,15 @@ export const mcpPlugin = definePlugin((options?: McpPluginOptions) => {
       // adding a stdio server registered only the integration, so it landed with
       // zero connections and therefore zero tools (the "no tools detected"
       // report). For each such integration with no connection, create the
-      // default no-auth connection and preserve any inline `env` as static
-      // subprocess environment on the config.
+      // default one — and move any legacy inline `env` (then stored plaintext in
+      // the config blob) into the connection's secret store, rewriting the
+      // config to the canonical shape that only declares the var NAMES.
       //
       // Idempotent and order-safe: once a connection exists the integration is
-      // skipped. A single bad integration is logged and skipped, never failing
-      // the caller.
+      // skipped; the secret is persisted (connection.create) BEFORE the config
+      // is stripped, so a failure between the two leaves the env recoverable
+      // (the connection has it, and the still-inline config env also works). A
+      // single bad integration is logged and skipped, never failing the caller.
       const reconcileStdioConnections = () =>
         Effect.gen(function* () {
           const integrations = yield* ctx.core.integrations.list();
@@ -1010,21 +1023,30 @@ export const mcpPlugin = definePlugin((options?: McpPluginOptions) => {
               });
               if (connections.length > 0) return; // already connectable — nothing to heal.
 
+              const inlineEnv = config.env ?? {};
+              const envVars = Object.keys(inlineEnv);
+              const hasEnv = envVars.length > 0;
+
               yield* ctx.connections.create({
                 owner: "org",
                 name: ConnectionName.make("default"),
                 integration: integration.slug,
-                template: AuthTemplateSlug.make("none"),
-                values: {},
+                template: AuthTemplateSlug.make(hasEnv ? STDIO_ENV_TEMPLATE : "none"),
+                values: hasEnv ? { ...inlineEnv } : {},
               });
 
+              // The secret is now on the connection: canonicalize this legacy
+              // config (declare the var names as a stdio_env method, dropping the
+              // inline plaintext values; or `none` for a no-secret server).
               const nextConfig: McpIntegrationConfigType = {
                 transport: "stdio",
                 command: config.command,
                 args: config.args,
-                env: config.env,
                 cwd: config.cwd,
-                authenticationTemplate: [{ slug: "none", kind: "none" }],
+                versionNegotiation: config.versionNegotiation,
+                authenticationTemplate: hasEnv
+                  ? [{ slug: STDIO_ENV_TEMPLATE, kind: "stdio_env", vars: envVars }]
+                  : [{ slug: "none", kind: "none" }],
               };
               yield* ctx.core.integrations.update(integration.slug, { config: nextConfig });
             }).pipe(
@@ -1507,12 +1529,13 @@ export const mcpPlugin = definePlugin((options?: McpPluginOptions) => {
           }
         }
 
+        const invokeHttpClientLayer = options?.httpClientLayer ?? ctx.httpClientLayer;
         const connectorInput = yield* buildConnectorInput(
           parsed,
           credential.values,
           String(credential.template),
           allowStdio,
-          options?.httpClientLayer ?? ctx.httpClientLayer,
+          invokeHttpClientLayer,
         );
         const connector: McpConnector = createMcpConnector(connectorInput);
         const poolKey =
@@ -1563,6 +1586,18 @@ export const mcpPlugin = definePlugin((options?: McpPluginOptions) => {
             return yield* ctx.connections
               .markToolsStale(connectionRef)
               .pipe(Effect.ignore, Effect.as(unknownToolFailure(String(toolRow.name), credential)));
+          }
+          if (parsed.transport === "remote") {
+            const recoveredSlackConnectFile = yield* recoverSlackConnectFile({
+              endpoint: parsed.endpoint,
+              toolName: stamp.toolName,
+              args,
+              accessToken: credential.values[TOKEN_VARIABLE],
+              upstreamErrorMessage: errorMessage,
+            }).pipe(Effect.provide(invokeHttpClientLayer));
+            if (Option.isSome(recoveredSlackConnectFile)) {
+              return ToolResult.ok(recoveredSlackConnectFile.value);
+            }
           }
           return ToolResult.fail({
             code: "mcp_tool_error",
