@@ -269,15 +269,21 @@ function StdioEdit(props: {
 
     const args = parseStdioArgs(argsDraft);
     const cwd = cwdDraft.trim();
+    const {
+      transport: _transport,
+      command: _command,
+      args: _args,
+      env: _env,
+      cwd: _cwd,
+      ...rest
+    } = server.config;
     const nextConfig: Extract<McpIntegrationConfig, { transport: "stdio" }> = {
+      ...rest,
       transport: "stdio",
       command,
       ...(args.length > 0 ? { args } : {}),
       ...(parsedEnv.env !== undefined ? { env: parsedEnv.env } : {}),
       ...(cwd.length > 0 ? { cwd } : {}),
-      ...(server.config.authenticationTemplate !== undefined
-        ? { authenticationTemplate: server.config.authenticationTemplate }
-        : {}),
     };
 
     if (

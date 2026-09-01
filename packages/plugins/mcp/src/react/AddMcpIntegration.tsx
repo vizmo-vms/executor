@@ -37,9 +37,19 @@ import {
 import { integrationWriteKeys } from "@executor-js/react/api/reactivity-keys";
 import type { McpAuthMethodInput } from "../sdk/types";
 import { probeMcpEndpoint, addMcpServer } from "./atoms";
+import { placementFromHeaderPattern } from "@executor-js/react/lib/auth-placements";
 import { McpRemoteIntegrationFields } from "./McpRemoteIntegrationFields";
-import { mcpAuthMethodInputFromEditorValue, mcpWireAuthInput } from "./auth-method-config";
+import { McpRequestHeadersEditor } from "./McpRequestHeadersEditor";
+import { mcpHeadersFromRows, type McpHeaderRow } from "./request-headers";
+import {
+  mcpAuthMethodInputFromEditorValue,
+  mcpDetectedAuthSeeds,
+  mcpWireAuthInput,
+} from "./auth-method-config";
+import CodexPluginAdd from "./CodexPluginAdd";
+import { isProbableMcpEndpoint } from "./probe-url";
 import { cloudflareNeedsCodemodeOptOut } from "../sdk/cloudflare-codemode";
+import { isCodexPresetId } from "../sdk/codex-plugin-presets";
 import { mcpPresets, type McpPreset } from "../sdk/presets";
 import {
   parseStdioArgs,
@@ -79,6 +89,8 @@ type ProbeResult = {
   toolCount: number | null;
   serverName: string | null;
   instructions: string | null;
+  /** "legacy" when only the legacy handshake worked (version-echoing server). */
+  versionNegotiation?: "auto" | "legacy";
 };
 
 type State =
@@ -161,6 +173,9 @@ export default function AddMcpIntegration(props: {
   onCancel: () => void;
   initialUrl?: string;
   initialPreset?: string;
+  initialAuthHeader?: string;
+  initialAuthNote?: string;
+  initialAuthKind?: string;
   /** Whether the stdio transport is enabled on the server. */
   allowStdio?: boolean;
 }) {
@@ -169,7 +184,11 @@ export default function AddMcpIntegration(props: {
   // Drop stdio presets when stdio is disabled — the caller should have
   // already filtered these out, but defence-in-depth.
   const preset = rawPreset?.transport === "stdio" && !allowStdio ? undefined : rawPreset;
-  const isStdioPreset = preset?.transport === "stdio";
+  // A Codex plugin preset is a catalog pointer, not a spawn recipe: it gets
+  // its own focused add screen (rendered below, before the generic form),
+  // fed by the server-side scanner.
+  const isCodexPreset = isCodexPresetId(preset?.id);
+  const isStdioPreset = preset?.transport === "stdio" && !isCodexPreset;
 
   const [transport, setTransport] = useState<"remote" | "stdio">(
     isStdioPreset && allowStdio ? "stdio" : "remote",
@@ -202,6 +221,12 @@ export default function AddMcpIntegration(props: {
     remoteUrl ? { step: "url" as const, url: remoteUrl } : init,
   );
 
+  // Static request headers for the endpoint (e.g. a Cloudflare Access service
+  // token). They gate the probe as much as the live traffic, so the same
+  // values feed both.
+  const [headerRows, setHeaderRows] = useState<readonly McpHeaderRow[]>([]);
+  const headers = useMemo(() => mcpHeadersFromRows(headerRows), [headerRows]);
+
   const doProbe = useAtomSet(probeMcpEndpoint, { mode: "promiseExit" });
   const doAddServer = useAtomSet(addMcpServer, { mode: "promiseExit" });
 
@@ -210,29 +235,16 @@ export default function AddMcpIntegration(props: {
   // The probe seeds the method list: detected OAuth → an OAuth row; a 401
   // without OAuth metadata → a bearer-header row; an open server → a no-auth
   // row. The user can edit any row or add alternate methods alongside.
-  const authMethodSeeds: readonly AuthMethodSeed[] = useMemo(() => {
-    if (!probe) return [];
-    if (probe.requiresOAuth) {
-      return [
-        {
-          value: { kind: "oauth", authorizationUrl: "", tokenUrl: "", scopes: [] },
-          label: "Detected",
-        },
-      ];
-    }
-    if (probe.requiresAuthentication) {
-      return [
-        {
-          value: {
-            kind: "apikey",
-            placements: [{ carrier: "header", name: "Authorization", prefix: "Bearer " }],
-          },
-          label: "Detected",
-        },
-      ];
-    }
-    return [{ value: { kind: "none" }, label: "Detected" }];
-  }, [probe]);
+  const authMethodSeeds: readonly AuthMethodSeed[] = useMemo(
+    () =>
+      mcpDetectedAuthSeeds(probe, {
+        placement: props.initialAuthHeader
+          ? placementFromHeaderPattern(props.initialAuthHeader)
+          : null,
+        kind: props.initialAuthKind,
+      }),
+    [probe, props.initialAuthHeader, props.initialAuthKind],
+  );
   const authMethodList = useAuthMethodList(authMethodSeeds);
 
   const remoteIdentity = useIntegrationIdentity({
@@ -264,11 +276,23 @@ export default function AddMcpIntegration(props: {
 
   // ---- Remote actions ----
 
+  // Each probe run takes a token. Editing the URL invalidates it, so a reply
+  // that lands after the user has moved on is dropped instead of reporting on
+  // a URL that is no longer in the field. The probe atom exposes no abort
+  // signal, so the request itself still finishes; only its answer is ignored.
+  const probeRunRef = useRef(0);
+
+  useEffect(() => {
+    probeRunRef.current += 1;
+  }, [state.url]);
+
   const handleProbe = useCallback(async () => {
+    const run = (probeRunRef.current += 1);
     dispatch({ type: "probe-start" });
     const exit = await doProbe({
-      payload: { endpoint: state.url.trim() },
+      payload: { endpoint: state.url.trim(), ...(headers ? { headers } : {}) },
     });
+    if (run !== probeRunRef.current) return;
     if (Exit.isFailure(exit)) {
       dispatch({
         type: "probe-fail",
@@ -277,7 +301,7 @@ export default function AddMcpIntegration(props: {
       return;
     }
     dispatch({ type: "probe-ok", probe: exit.value });
-  }, [state.url, doProbe]);
+  }, [state.url, headers, doProbe]);
 
   // Keep the latest handleProbe in a ref so the debounced effect can call it
   // without depending on its identity (which changes every render).
@@ -285,12 +309,14 @@ export default function AddMcpIntegration(props: {
   handleProbeRef.current = handleProbe;
 
   // Auto-probe whenever the URL changes (debounced) while we're on the
-  // remote transport and not already probing/probed.
+  // remote transport and not already probing/probed. The shape gate keeps a
+  // half-typed URL from being dialled: without it every keystroke that is a
+  // non-empty string gets probed, and the field flashes through a loading and
+  // then an error state for values the user never meant to submit.
   useEffect(() => {
     if (transport !== "remote") return;
     if (state.step !== "url") return;
-    const trimmed = state.url.trim();
-    if (!trimmed) return;
+    if (!isProbableMcpEndpoint(state.url)) return;
     const handle = setTimeout(() => {
       handleProbeRef.current();
     }, 400);
@@ -312,7 +338,14 @@ export default function AddMcpIntegration(props: {
             : {}),
           endpoint: state.url.trim(),
           ...(slug ? { slug } : {}),
+          ...(headers ? { headers } : {}),
           authenticationTemplate,
+          // The probe reports when only legacy negotiation worked (a server
+          // that echoes the modern revision but breaks its contract); pin it
+          // so refreshes and tool calls use the same handshake.
+          ...(probe?.versionNegotiation === "legacy"
+            ? { versionNegotiation: "legacy" as const }
+            : {}),
         },
         reactivityKeys: integrationWriteKeys,
       });
@@ -325,7 +358,7 @@ export default function AddMcpIntegration(props: {
       }
       return exit.value.slug;
     },
-    [doAddServer, probe, remoteIdentity, resolvedDescription, state.url],
+    [doAddServer, headers, probe, remoteIdentity, resolvedDescription, state.url],
   );
 
   const handleAddRemote = useCallback(async () => {
@@ -380,6 +413,18 @@ export default function AddMcpIntegration(props: {
   }, [stdioCommand, stdioArgs, stdioEnvText, stdioCwd, stdioIdentity, doAddServer, props]);
 
   // ---- Render ----
+
+  // Placed after every hook so the hook order is identical on all renders;
+  // `isCodexPreset` is fixed for the component's lifetime (route search param).
+  if (isCodexPreset && preset) {
+    return (
+      <CodexPluginAdd
+        presetId={preset.id}
+        onComplete={props.onComplete}
+        onCancel={props.onCancel}
+      />
+    );
+  }
 
   return (
     <div className="flex flex-1 flex-col gap-6">
@@ -448,6 +493,16 @@ export default function AddMcpIntegration(props: {
             </Info>
           )}
 
+          {/* Static request headers. Shown in every remote state, because an
+              endpoint behind an edge authenticator (Cloudflare Access) fails
+              the very first probe until its service-token headers are set. */}
+          <McpRequestHeadersEditor
+            rows={headerRows}
+            onChange={setHeaderRows}
+            onTest={handleProbe}
+            testing={isProbing}
+          />
+
           {/* Authentication — declares the auth methods to register through the
               shared list editor. The credentials themselves (API key value /
               OAuth sign-in) are added from the integration's detail hub after
@@ -458,9 +513,13 @@ export default function AddMcpIntegration(props: {
               title="How does this server authenticate?"
               oauthMetadata="discovered"
               emptyHint="No methods declared. Add a method, or add the server without auth and connect from the integration page later."
-              footerHint="Every method here is registered with the server. Connect an account from the integration page after adding."
+              footerHint="Nothing here takes your credential. Add the integration first, then connect an account on its page."
             />
           )}
+
+          {probe && props.initialAuthNote ? (
+            <p className="text-xs leading-relaxed text-muted-foreground">{props.initialAuthNote}</p>
+          ) : null}
 
           {/* Error (add server). Probe errors show inline on the field. */}
           {otherError && (

@@ -61,6 +61,9 @@ export type McpStdioVersionNegotiation = typeof McpStdioVersionNegotiation.Type;
 //   oauth2 — the value is an OAuth access token, applied as a Bearer header
 //            via the MCP SDK's OAuthClientProvider. MCP oauth carries no
 //            stored endpoints: metadata is discovered live at connect time.
+//            A non-empty scope list may be declared when a server does not
+//            expose scopes through protected-resource metadata; otherwise they
+//            are discovered too.
 // ---------------------------------------------------------------------------
 
 /** Enterprise-Managed Authorization opt-in: which registered OAuth app plays the
@@ -80,6 +83,7 @@ export type McpEnterpriseIdentityProvider = typeof McpEnterpriseIdentityProvider
 export const McpOAuthMethod = Schema.Struct({
   slug: Schema.String,
   kind: Schema.Literal("oauth2"),
+  scopes: Schema.optional(Schema.NonEmptyArray(Schema.String)),
   enterpriseIdentityProvider: Schema.optional(McpEnterpriseIdentityProvider),
 });
 export type McpOAuthMethod = typeof McpOAuthMethod.Type;
@@ -147,6 +151,7 @@ export const McpAuthMethodInput = Schema.Union([
   Schema.Struct({
     slug: Schema.optional(Schema.String),
     kind: Schema.Literal("oauth2"),
+    scopes: Schema.optional(Schema.NonEmptyArray(Schema.String)),
     enterpriseIdentityProvider: Schema.optional(McpEnterpriseIdentityProvider),
   }),
   // Credential methods are authored request-shaped — the ONE apikey input
@@ -210,6 +215,8 @@ const StringMap = Schema.Record(Schema.String, Schema.String);
 
 export const McpRemoteIntegrationConfig = Schema.Struct({
   transport: Schema.Literal("remote"),
+  /** Optional catalog family used to group related integrations. */
+  family: Schema.optional(Schema.String),
   /** The MCP server endpoint URL */
   endpoint: Schema.String,
   /** Transport preference for this remote server */
@@ -224,11 +231,19 @@ export const McpRemoteIntegrationConfig = Schema.Struct({
   /** Declared auth methods — how a connection's values are rendered onto
    *  requests. A connection's `template` picks one by slug. */
   authenticationTemplate: Schema.Array(McpAuthMethod),
+  /** Protocol negotiation. Remote defaults to `auto` (2026-07-28 era).
+   *  `legacy` pins servers that ECHO the proposed revision and then violate
+   *  its response contract — Walmart's MCP answers "2026-07-28" to any
+   *  proposal while emitting 2024-era results, which the modern client
+   *  rightly rejects. */
+  versionNegotiation: Schema.optional(McpStdioVersionNegotiation),
 });
 export type McpRemoteIntegrationConfig = typeof McpRemoteIntegrationConfig.Type;
 
 export const McpStdioIntegrationConfig = Schema.Struct({
   transport: Schema.Literal("stdio"),
+  /** Optional catalog family used to group related integrations. */
+  family: Schema.optional(Schema.String),
   /** The command to run */
   command: Schema.String,
   /** Arguments to the command */
@@ -245,6 +260,40 @@ export const McpStdioIntegrationConfig = Schema.Struct({
   /** Protocol negotiation at connect. Absent means `legacy` (see
    *  `McpStdioVersionNegotiation` for why that stays the default). */
   versionNegotiation: Schema.optional(McpStdioVersionNegotiation),
+  /** Opt out of process reuse: spawn a fresh child for every tool call.
+   *  Absent means pooled — the spawned server is kept alive between calls
+   *  (five-minute idle window), which is how every mainstream MCP client
+   *  drives stdio servers and what the protocol's session model assumes. Set
+   *  this only for a server that genuinely depends on fresh-process
+   *  semantics, e.g. one that re-reads state at boot and never afterwards. */
+  spawnPerCall: Schema.optional(Schema.Boolean),
+  /** Present when the spawned command is `codex app-server` rather than an
+   *  MCP server itself: the connector then bridges MCP to the Codex
+   *  app-server protocol in process, and `server` names the MCP server
+   *  inside Codex whose tools this integration exposes (e.g. `messages`).
+   *  This is how the curated Codex plugins are reached — since 2026-08-28
+   *  their service only honours tool calls from a Codex host session, so
+   *  spawning their client binary directly can list tools but not call them.
+   *  `versionNegotiation` is ignored when this is set (the bridge answers
+   *  the handshake itself). */
+  appServer: Schema.optional(
+    Schema.Struct({
+      server: Schema.String,
+      /** A projected tool surface for a plugin that has no MCP server of its
+       *  own and is driven through Codex's `node_repl`: `sky` is Computer Use
+       *  (`codex-sky-tools.ts`), `browser` is Chrome
+       *  (`codex-browser-tools.ts`). Absent exposes the server's own tools
+       *  verbatim. */
+      surface: Schema.optional(Schema.Literals(["sky", "browser"])),
+      /** Absolute path to the module a projected surface imports (currently
+       *  Chrome's `browser-client.mjs`). Machine-specific, so it is resolved
+       *  by the scanner rather than hardcoded. */
+      modulePath: Schema.optional(Schema.String),
+      /** Which curated Codex plugin this is, so a macOS permission failure can
+       *  name the exact grant to enable. */
+      presetId: Schema.optional(Schema.String),
+    }),
+  ),
   /** Declared auth methods — a single `stdio_env` method naming the secret env
    *  vars, or `none`. A connection's `template` picks one by slug, exactly as
    *  for remote servers. Optional so pre-revamp stdio configs (which had no
@@ -281,6 +330,16 @@ export const McpToolAnnotations = Schema.Struct({
   openWorldHint: Schema.optional(Schema.Boolean),
 });
 export type McpToolAnnotations = typeof McpToolAnnotations.Type;
+
+// ---------------------------------------------------------------------------
+// Tool `_meta` — the reserved, implementation-defined map the MCP spec puts on
+// `Tool`. It is opaque to the executor and to the model: servers use it for
+// host-only routing and policy hints that do not belong in the closed
+// `annotations` set. It is carried through verbatim, never interpreted.
+// ---------------------------------------------------------------------------
+
+export const McpToolMeta = Schema.Record(Schema.String, Schema.Unknown);
+export type McpToolMeta = typeof McpToolMeta.Type;
 
 // ---------------------------------------------------------------------------
 // Tool binding — maps a persisted (sanitized) tool name back to its real MCP
