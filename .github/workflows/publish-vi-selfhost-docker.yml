@@ -27,14 +27,16 @@ jobs:
           node-version: 24
       - run: bun install --frozen-lockfile
       - run: bun run format:check
+      - run: bunx vitest run tests/codegraph-repo-sync.test.ts
       - run: docker build --pull --file Dockerfile.coolify --tag executor-tools:e2e .
       - run: docker run --rm --entrypoint /usr/local/bin/node executor-tools:e2e --version
       - run: docker run --rm --entrypoint /usr/local/bin/npx executor-tools:e2e --version
+      - run: docker run --rm --entrypoint /usr/local/bin/codegraph executor-tools:e2e --version
       - name: Verify generic stdio command runtime
         run: |
           docker run --rm --entrypoint /bin/bash executor-tools:e2e -lc '
             set -euo pipefail
-            command -v sh bash env node npm npx bun bunx
+            command -v sh bash env git node npm npx bun bunx codegraph codegraph-repo-sync
             npm exec --yes --package=cowsay -- cowsay generic-stdio-npx | grep -Fq generic-stdio-npx
             bunx cowsay generic-stdio-bunx | grep -Fq generic-stdio-bunx
             printf "%s\\n" "#!/usr/bin/env node" "console.log(\"generic-stdio-shebang\")" > /tmp/stdio-shebang

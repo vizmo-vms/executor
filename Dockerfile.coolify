@@ -1,5 +1,6 @@
 # syntax=docker/dockerfile:1
 ARG NODE_IMAGE=node:24.19.0-bookworm-slim
+ARG CODEGRAPH_VERSION=1.6.0
 
 # Build Executor from this checkout so every fork release contains the tagged
 # application source instead of inheriting an older published application.
@@ -39,9 +40,12 @@ RUN set -eux; \
 # environment (sh, bash, env, coreutils), Node/npm/npx, and Bun/bunx without
 # recompiling Executor in Coolify.
 FROM ${NODE_IMAGE} AS runtime
+ARG CODEGRAPH_VERSION
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends bash ca-certificates coreutils \
+  && apt-get install -y --no-install-recommends bash ca-certificates coreutils git \
   && rm -rf /var/lib/apt/lists/*
+RUN npm install --global "@colbymchenry/codegraph@${CODEGRAPH_VERSION}" \
+  && npm cache clean --force
 
 WORKDIR /app
 COPY --from=prod-deps /usr/local/bin/bun /usr/local/bin/bun
@@ -52,13 +56,21 @@ COPY --from=tools /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certifica
 COPY --from=tools /out/signoz-mcp-server /usr/local/bin/signoz-mcp-server
 COPY --from=tools /out/coder /usr/local/bin/coder
 
+# Set EXECUTOR_CODEGRAPH_GITHUB_REPOS to comma-separated owner/name values,
+# provide a read-only EXECUTOR_CODEGRAPH_GITHUB_TOKEN, and schedule
+# /usr/local/bin/codegraph-repo-sync with Coolify cron.
 ENV NODE_ENV=production \
     EXECUTOR_HOST=0.0.0.0 \
     PORT=4788 \
-    EXECUTOR_DATA_DIR=/data
+    EXECUTOR_DATA_DIR=/data \
+    EXECUTOR_CODEGRAPH_WORKSPACE=/workspace \
+    EXECUTOR_CODEGRAPH_GITHUB_BRANCH=prod
+COPY --chmod=755 scripts/codegraph-repo-sync.sh /usr/local/bin/codegraph-repo-sync
 WORKDIR /app/apps/host-selfhost
-VOLUME ["/data"]
+# Persist repository checkouts and their in-tree .codegraph indexes separately
+# from Executor's database and generated keys.
+VOLUME ["/data", "/workspace"]
 EXPOSE 4788
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=5 \
   CMD ["bun", "-e", "fetch('http://127.0.0.1:4788/api/health').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
-CMD ["bun", "run", "dist-server/serve.js"]
+CMD ["sh", "-c", "unset EXECUTOR_CODEGRAPH_GITHUB_TOKEN; exec bun run dist-server/serve.js"]
