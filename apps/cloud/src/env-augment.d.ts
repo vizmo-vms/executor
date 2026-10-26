@@ -5,6 +5,12 @@
 declare global {
   namespace Cloudflare {
     interface Env {
+      /** TOTP enrollment and verification attempts; absence refuses verification. */
+      ADMIN_MFA_RATE_LIMITER?: {
+        readonly limit: (options: {
+          readonly key: string;
+        }) => Promise<{ readonly success: boolean }>;
+      };
       // Observability
       // Worker version metadata binding (wrangler.jsonc `version_metadata`).
       // Optional so test workers and local setups without the binding still
@@ -130,6 +136,22 @@ declare global {
        *  (see `RESIDENT_RUNTIME_SOFT_CAP`). Unset in production. */
       MCP_RESIDENT_RUNTIME_SOFT_CAP?: string;
       NODE_ENV?: string;
+
+      // v2 on executor.sh (wrangler.jsonc `services` + `vars`). Optional so
+      // local dev and test workers without them serve everything from v1.
+      /** Service binding to v2's API Worker; `edge/marketing.ts` forwards to it. */
+      V2?: Fetcher;
+      /** Absolute URL `/sign-up` and `/signup` redirect to. */
+      V2_SIGN_UP_URL?: string;
+      /** Prefix of v2's connected-account OAuth `state`; `/api/oauth/callback`
+       *  requests whose state starts with it go to v2. */
+      V2_OAUTH_STATE_PREFIX?: string;
+      /** Root of v2's PostHog browser proxy (`/api/<16 hex>`), which v2's
+       *  marketing pages call on executor.sh; forwarded with its subpaths. */
+      V2_ANALYTICS_PROXY_PATH?: string;
+      /** v2's Sentry browser error tunnel (`/api/<16 hex>/submit`), forwarded
+       *  exactly. */
+      V2_ERROR_TUNNEL_PATH?: string;
 
       // Shared with frontend
       VITE_PUBLIC_SITE_URL?: string;

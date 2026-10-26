@@ -4,13 +4,13 @@ ARG CODEGRAPH_VERSION=1.6.0
 
 # Build Executor from this checkout so every fork release contains the tagged
 # application source instead of inheriting an older published application.
-FROM oven/bun:1 AS prod-deps
+FROM oven/bun:1.4.4@sha256:1d22548f177f4ff38e0c15baa3c2c46c6c2060ba2d1bc573bb4720b407548f1d AS prod-deps
 WORKDIR /app
 COPY . .
 RUN bun install --frozen-lockfile --production --ignore-scripts --filter @executor-js/host-selfhost \
   && bun run apps/host-selfhost/scripts/package-runtime.ts
 
-FROM oven/bun:1 AS build
+FROM oven/bun:1.4.4@sha256:1d22548f177f4ff38e0c15baa3c2c46c6c2060ba2d1bc573bb4720b407548f1d AS build
 WORKDIR /app
 COPY . .
 ARG EXECUTOR_ALLOW_STDIO_MCP=true

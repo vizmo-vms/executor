@@ -307,16 +307,19 @@ export const optionalScopesFromAuthorizationUrl = (authorizationUrl: string): re
 // statically advertises `app.datadoghq.com`. Redeeming the code at the
 // advertised host then fails with `invalid_grant`.
 //
-// `rebindTokenEndpointHostToCallbackDomain` swaps ONLY the hostname of the
-// configured token URL to the callback-supplied host, and ONLY when that host
-// is a sibling subdomain of the configured one (same parent after stripping the
-// leftmost DNS label, e.g. `app.datadoghq.com` and `us5.datadoghq.com` both
-// reduce to `datadoghq.com`). The token request carries the client secret, the
-// code, and the PKCE verifier, so an attacker-influenced `domain` must never be
-// able to point it at an arbitrary origin. Anything that fails the sibling
-// check, fails to parse, or isn't https falls back to the configured URL
-// unchanged.
+// Token requests carry client credentials and grants. Callback data can select
+// only an explicitly supported Datadog region, never a generic DNS sibling.
+// Keep this list limited to the commercial datadoghq.com region family that
+// this integration supports; other providers use their configured endpoint.
 // ---------------------------------------------------------------------------
+
+const DATADOG_REGIONAL_TOKEN_HOSTS: ReadonlySet<string> = new Set([
+  "app.datadoghq.com",
+  "us3.datadoghq.com",
+  "us5.datadoghq.com",
+  "ap1.datadoghq.com",
+  "ap2.datadoghq.com",
+]);
 
 const hostnameFromCallbackDomain = (callbackDomain: string): string | undefined => {
   const trimmed = callbackDomain.trim();
@@ -327,23 +330,17 @@ const hostnameFromCallbackDomain = (callbackDomain: string): string | undefined 
   if (!URL.canParse(candidate)) return undefined;
   const url = new URL(candidate);
   // A legitimate regional host carries no port, credentials, or path.
-  if (url.port !== "" || url.username !== "" || url.password !== "") return undefined;
+  if (url.protocol !== "https:" || url.port !== "" || url.username !== "" || url.password !== "") {
+    return undefined;
+  }
+  if (url.search !== "" || url.hash !== "") return undefined;
   if (url.pathname !== "/" && url.pathname !== "") return undefined;
   return url.hostname.toLowerCase();
 };
 
-/** Parent domain after stripping the leftmost DNS label, or `undefined` when
- *  the host has no sibling space (a single label, or a parent that is a bare
- *  TLD). `app.datadoghq.com` -> `datadoghq.com`; `foo.com` -> undefined. */
-const siblingParentDomainOf = (hostname: string): string | undefined => {
-  const labels = hostname.split(".");
-  if (labels.length < 3) return undefined;
-  const parent = labels.slice(1).join(".");
-  // Require the parent to itself be multi-label so a 2-label configured host
-  // can never rebind across an entire TLD (e.g. foo.com -> bar.com).
-  return parent.includes(".") ? parent : undefined;
-};
-
+/** Select a supported Datadog token host from callback data, preserving every
+ * other URL component. Untrusted or malformed callbacks leave the configured
+ * endpoint unchanged; DNS suffix similarity never grants trust. */
 export const rebindTokenEndpointHostToCallbackDomain = (
   configuredTokenUrl: string,
   callbackDomain: string | null | undefined,
@@ -351,19 +348,42 @@ export const rebindTokenEndpointHostToCallbackDomain = (
   if (!callbackDomain) return configuredTokenUrl;
   if (!URL.canParse(configuredTokenUrl)) return configuredTokenUrl;
   const configured = new URL(configuredTokenUrl);
-  if (configured.protocol !== "https:") return configuredTokenUrl;
+  if (
+    configured.protocol !== "https:" ||
+    configured.port !== "" ||
+    configured.username !== "" ||
+    configured.password !== ""
+  )
+    return configuredTokenUrl;
   const targetHost = hostnameFromCallbackDomain(callbackDomain);
   if (!targetHost) return configuredTokenUrl;
   const configuredHost = configured.hostname.toLowerCase();
   if (targetHost === configuredHost) return configuredTokenUrl;
-  const configuredParent = siblingParentDomainOf(configuredHost);
-  const targetParent = siblingParentDomainOf(targetHost);
-  if (!configuredParent || !targetParent || configuredParent !== targetParent) {
+  if (
+    !DATADOG_REGIONAL_TOKEN_HOSTS.has(configuredHost) ||
+    !DATADOG_REGIONAL_TOKEN_HOSTS.has(targetHost)
+  ) {
     return configuredTokenUrl;
   }
   const rebound = new URL(configuredTokenUrl);
   rebound.hostname = targetHost;
   return rebound.toString();
+};
+
+/** Parse a persisted refresh endpoint against the current client configuration.
+ * Only the configured URL or an exact supported regional substitution is
+ * accepted. Invalid legacy overrides return undefined, requiring reconnect. */
+export const tokenEndpointForRefresh = (
+  configuredTokenUrl: string,
+  persistedTokenUrl: string | null,
+): string | undefined => {
+  if (persistedTokenUrl === null || persistedTokenUrl === configuredTokenUrl) {
+    return configuredTokenUrl;
+  }
+  if (!URL.canParse(persistedTokenUrl) || !URL.canParse(configuredTokenUrl)) return undefined;
+  const persisted = new URL(persistedTokenUrl);
+  const trusted = rebindTokenEndpointHostToCallbackDomain(configuredTokenUrl, persisted.origin);
+  return new URL(trusted).href === persisted.href ? trusted : undefined;
 };
 
 // ---------------------------------------------------------------------------
@@ -1117,16 +1137,74 @@ const stripIdToken = async (response: Response): Promise<StrippedTokenResponse> 
   };
 };
 
+const SlackGrant = Schema.Struct({
+  access_token: Schema.optional(Schema.String),
+  token_type: Schema.optional(Schema.Literals(["bot", "user", "Bearer", "bearer"])),
+  refresh_token: Schema.optional(Schema.String),
+  expires_in: Schema.optional(Schema.Number),
+  scope: Schema.optional(Schema.String),
+});
+const decodeSlackEnvelope = Schema.decodeUnknownOption(
+  Schema.Struct({
+    ...SlackGrant.fields,
+    ok: Schema.Literal(true),
+    authed_user: Schema.optional(SlackGrant),
+  }),
+);
+
+/** Slack's `bot` and `user` values identify the account, not an HTTP auth
+ * scheme. Project its successful envelope to an RFC 6749 bearer grant before
+ * oauth4webapi validates it. User-only grants may live entirely in authed_user;
+ * never replace a populated top-level grant with another account's grant. */
+const normalizeSlackTokenEnvelope = async (response: Response): Promise<Response> => {
+  const decoded = decodeSlackEnvelope(await safeJsonFromResponse(response));
+  if (Option.isNone(decoded)) return response;
+  const envelope = decoded.value;
+  const user = envelope.authed_user;
+  const grant =
+    user?.access_token !== undefined &&
+    (envelope.access_token === undefined || !envelope.scope?.trim())
+      ? user
+      : envelope;
+  // Standard bearer responses may also contain `ok: true`. Preserve their
+  // scopes and provider metadata; only Slack's actor token types need adapting.
+  if (
+    grant.access_token === undefined ||
+    (grant.token_type !== "bot" && grant.token_type !== "user")
+  ) {
+    return response;
+  }
+  const scope = grant.scope
+    ?.split(/[\s,]+/)
+    .filter(Boolean)
+    .join(" ");
+  return new Response(
+    JSON.stringify({
+      access_token: grant.access_token,
+      token_type: "Bearer",
+      refresh_token: grant.refresh_token,
+      expires_in: grant.expires_in,
+      ...(scope ? { scope } : {}),
+    }),
+    {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    },
+  );
+};
+
 const processTokenEndpointResponse = async (
   as: oauth.AuthorizationServer,
   client: oauth.Client,
   response: Response,
 ): Promise<OAuth2TokenResponse> => {
   const stripped = await stripIdToken(response);
-  const providerUserGrant = await nestedAuthedUserGrant(stripped.response);
+  const normalizedResponse = await normalizeSlackTokenEnvelope(stripped.response);
+  const providerUserGrant = await nestedAuthedUserGrant(normalizedResponse);
   const parsed = tokenResponseFrom(
     as,
-    await oauth.processGenericTokenEndpointResponse(as, client, stripped.response),
+    await oauth.processGenericTokenEndpointResponse(as, client, normalizedResponse),
   );
   const token =
     parsed.scope === undefined && providerUserGrant !== undefined
@@ -1442,7 +1520,7 @@ export const refreshAccessToken = (
         const result = await oauth.processRefreshTokenResponse(
           as,
           client,
-          (await stripIdToken(response)).response,
+          await normalizeSlackTokenEnvelope((await stripIdToken(response)).response),
         );
         return tokenResponseFrom(as, result);
       },
